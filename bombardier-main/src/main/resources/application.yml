@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: bombardier
+
+server:
+  port: 1234
+  http2:
+    enabled: true
+  error:
+    include-exception: false
+    include-message: always
+    include-stacktrace: always
+
+security:
+  secret: secret12345678
+  token-lifetime: 15m
+  refresh-token-lifetime: 30d
+
+logstash:
+  url: logstash:4560
+
+management:
+  metrics:
+    web:
+      server:
+        request:
+          autotime:
+            percentiles: 0.95
+    export:
+      prometheus:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include : "info,health,prometheus,metrics"
+
+bombardier:
+  auth-enabled: false
+  teams:
+    - name: "test"
+      url: "http://${TEST_SERVICE_IP:127.0.0.1}:8081"
