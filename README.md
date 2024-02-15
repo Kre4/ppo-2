@@ -2,6 +2,7 @@
 Бомбардир
 * `docker-compose -f .\bombardier-main\docker-compose.yml up -d`
 * Запустить `DemoServiceApplication.kt`
+
 OnlineShopApp
 * `docker-compose -f .\high-load-course-main\docker-compose.yml up -d`
 * Запустить OnlineShopApplication.kt
