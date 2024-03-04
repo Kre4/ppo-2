@@ -36,11 +36,13 @@ class OrderPaymentSubscriber {
     @Qualifier(ExternalServicesConfig.PRIMARY_PAYMENT_BEAN)
     private lateinit var paymentService: PaymentService
 
-    private val paymentExecutor = Executors.newFixedThreadPool(16, NamedThreadFactory("payment-executor"))
+    // possible optimize
+    private val paymentExecutor = Executors.newFixedThreadPool(24, NamedThreadFactory("payment-executor"))
 
     @PostConstruct
     fun init() {
-        subscriptionsManager.createSubscriber(OrderAggregate::class, "payments:order-subscriber", retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)) {
+        // possible optimize retry conf attempts
+        subscriptionsManager.createSubscriber(OrderAggregate::class, "payments:order-subscriber", retryConf = RetryConf(4, RetryFailedStrategy.SKIP_EVENT)) {
             `when`(OrderPaymentStartedEvent::class) { event ->
                 paymentExecutor.submit {
                     val createdEvent = paymentESService.create {
