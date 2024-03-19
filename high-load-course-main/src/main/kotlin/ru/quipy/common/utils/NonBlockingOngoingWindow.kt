@@ -41,8 +41,8 @@ class OngoingWindow(
 ) {
     private val window = Semaphore(maxWinSize)
 
-    fun acquire() {
-        window.acquire()
+    fun acquire(): Boolean {
+        return window.tryAcquire()
     }
 
     fun release() = window.release()
