@@ -1,5 +1,8 @@
 package ru.quipy.payments.logic
 
+import ru.quipy.common.utils.NonBlockingOngoingWindow
+import ru.quipy.common.utils.OngoingWindow
+import ru.quipy.common.utils.RateLimiter
 import java.time.Duration
 import java.util.*
 
@@ -18,9 +21,14 @@ interface PaymentExternalService : PaymentService
 data class ExternalServiceProperties(
     val serviceName: String,
     val accountName: String,
-    val parallelRequests: Int,
-    val rateLimitPerSec: Int,
-    val request95thPercentileProcessingTime: Duration = Duration.ofSeconds(11)
+    val rateLimiter: RateLimiter,
+    val blockingWindow: OngoingWindow,
+    val unblockingWindow: NonBlockingOngoingWindow,
+    val upperLimit: Int,
+
+//    val request95thPercentileProcessingTime: Duration = Duration.ofSeconds(11)
+//    val window: NonBlockingOngoingWindow,
+//    val rateLimiter: Any?
 )
 
 /**

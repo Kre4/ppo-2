@@ -39,10 +39,14 @@ class NonBlockingOngoingWindow(
 class OngoingWindow(
     maxWinSize: Int
 ) {
-    private val window = Semaphore(maxWinSize)
+    private val window = Semaphore(maxWinSize, true)
 
-    fun acquire(): Boolean {
+    fun tryAcquire(): Boolean {
         return window.tryAcquire()
+    }
+
+    fun acquire() {
+        window.acquire()
     }
 
     fun release() = window.release()
