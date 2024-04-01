@@ -10,6 +10,9 @@ server:
     include-exception: false
     include-message: always
     include-stacktrace: always
+  tomcat:
+    threads:
+      max: 1000
 
 security:
   secret: secret12345678
