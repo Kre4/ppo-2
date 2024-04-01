@@ -7,6 +7,7 @@ import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.payments.logic.ExternalServiceProperties
 import ru.quipy.payments.logic.PaymentExternalServiceImpl
+import ru.quipy.payments.logic.PaymentQueue
 import java.time.Duration
 
 
@@ -14,6 +15,7 @@ import java.time.Duration
 class ExternalServicesConfig {
     companion object {
         const val PRIMARY_PAYMENT_BEAN = "PRIMARY_PAYMENT_BEAN"
+        const val PAYMENT_QUEUE_BEAN = "PAYMENT_QUEUE_BEAN"
         const val SECONDARY_PAYMENT_BEAN = "SECONDARY_PAYMENT_BEAN"
 
         // Ниже приведены готовые конфигурации нескольких аккаунтов провайдера оплаты.
@@ -23,7 +25,7 @@ class ExternalServicesConfig {
             // most expensive. Call costs 100
             "test",
             "default-1",
-            RateLimiter(100),
+            RateLimiter(150),
             OngoingWindow(1000),
             NonBlockingOngoingWindow(1000),
             1000)
@@ -32,23 +34,31 @@ class ExternalServicesConfig {
             // Call costs 70
             "test",
             "default-2",
-            RateLimiter(100),
+            RateLimiter(150),
             OngoingWindow(1000),
             NonBlockingOngoingWindow(1000),
             10_000
         )
 
-//        private val accountProps_3 = ExternalServiceProperties(
-//            // Call costs 40
-//            "test",
-//            "default-3",
-//        )
-//
-//        // Call costs 30
-//        private val accountProps_4 = ExternalServiceProperties(
-//            "test",
-//            "default-4",
-//        )
+        private val accountProps_3 = ExternalServiceProperties(
+            // Call costs 40
+            "test",
+            "default-3",
+            RateLimiter(15),
+            OngoingWindow(1000),
+            NonBlockingOngoingWindow(1000),
+            10_000
+        )
+
+        // Call costs 30
+        private val accountProps_4 = ExternalServiceProperties(
+            "test",
+            "default-4",
+            RateLimiter(15),
+            OngoingWindow(30),
+            NonBlockingOngoingWindow(30),
+            10_000
+        )
     }
 
     @Bean(PRIMARY_PAYMENT_BEAN)
@@ -58,6 +68,10 @@ class ExternalServicesConfig {
             accountProps_1
         )
 
+    @Bean(PAYMENT_QUEUE_BEAN)
+    fun paymentQueueDispatcher() = PaymentQueue(
+        listOf(accountProps_4, accountProps_3, accountProps_2)
+    )
 //    @Bean(SECONDARY_PAYMENT_BEAN)
 //    fun reserveExternalService() =
 //        PaymentExternalServiceImpl(
