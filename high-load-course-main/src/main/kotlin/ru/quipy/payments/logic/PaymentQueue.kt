@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.internal.synchronized
 import kotlinx.coroutines.launch
 import okhttp3.*
 import org.slf4j.LoggerFactory
@@ -24,6 +25,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReferenceArray
+import kotlin.math.abs
 import kotlin.math.log
 
 
@@ -37,6 +39,12 @@ class PaymentQueue(
         val logger = LoggerFactory.getLogger(PaymentQueue::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        val delta = 10_000
+        val requestsQueueSizeLimit: Int = 3000
+        // Посчитать объем V/W, где V объем очереди который можем позволить. Пусть на каждую 307Mb ~ 307_000_000B
+        // Элемент 100B -> можем иметь очередь на 3млн элементов, правда она нам не нужна
+
+        // Или считаем, что нужно хранить стэк, т.е 1mb, тогда 38
     }
 
     private val paymentExecutor = Executors.newFixedThreadPool(500, NamedThreadFactory("queue-executor"))
@@ -84,7 +92,8 @@ class PaymentQueue(
             }.invokeOnCompletion { th -> if (th != null) logger.error("Job completed", th) }
             val clearJob = scope.launch {
                 while (true) {
-                    delay(180_000)
+                    delay(20_000)
+                    logger.error("clear stat")
                     wrapper.executionTimes.clear()
                 }
             }
@@ -130,30 +139,50 @@ class PaymentQueue(
         val saved = paymentESService.update(paymentId) {
             it.logProcessing(success, now(), transactionId, reason = reason)
         }
-        logger.error("Request process saved, duration: ${saved.spentInQueueDuration}")
+//        logger.error("Request process saved, duration: ${saved.spentInQueueDuration}")
     }
 
     private fun putRequestInQueue(paymentId: UUID, transactionId: UUID, amount: Int, paymentStartedAt: Long) {
+
+        // если уже вы
         if (now() - paymentStartedAt > 75_000) {
             savePayment(paymentId, transactionId, false)
             return
         }
         val selectedProperty: AccountWrapper? = getProperties()
+
+        // не смогли получить ресурсы
         if (selectedProperty == null) {
             savePayment(paymentId, transactionId, false)
             return
         }
+
+        // а не переполнена ли очередь?
+        val currentQueueSize = selectedProperty.queue.size - 1
+        if (currentQueueSize > requestsQueueSizeLimit) {
+            // чистим очередь?
+        }
+
+        val predictedExecutionTime = getAvgExecTimeForAccount(selectedProperty) * currentQueueSize
+        logger.error(
+            "Avg exec time for ${selectedProperty.property.accountName} is $predictedExecutionTime ms "
+        )
+
+//        if (predictedExecutionTime - 80_000 > delta) {
+//            logger.error("sorry bro, too long ${(predictedExecutionTime)} ms")
+//            savePayment(paymentId, transactionId, false)
+//            return
+//        }
         selectedProperty.queue.put {
-//            runRequest(selectedProperty.property, transactionId, paymentId, paymentStartedAt)
             runAsyncRequest(selectedProperty, transactionId, paymentId, paymentStartedAt)
         }
     }
 
     private fun runRequest(
         property: ExternalServiceProperties,
-        transactionId: UUID,
-        paymentId: UUID,
-        paymentStartedAt: Long
+        transactionId: UUID, // 16 bytes
+        paymentId: UUID, // 16 bytes
+        paymentStartedAt: Long // 8 bytes
     ) {
         logger.error("run request")
         try {
@@ -185,15 +214,15 @@ class PaymentQueue(
     }
 
     private fun runAsyncRequest(
-        account: AccountWrapper,
-        transactionId: UUID,
-        paymentId: UUID,
-        paymentStartedAt: Long,
+        account: AccountWrapper, // 8 bytes
+        transactionId: UUID, // 16 bytes
+        paymentId: UUID, // 16 bytes
+        paymentStartedAt: Long // 8 bytes, -> total 48 bytes
     ) {
-        logger.error(
-            "Start new enqueue, dispatcher queued size: ${client.dispatcher.queuedCalls().size} " +
-                    "executed ${client.dispatcher.queuedCalls().stream().filter { it -> it.isExecuted() }.count()}"
-        )
+//        logger.error(
+//            "Start new enqueue, dispatcher queued size: ${client.dispatcher.queuedCalls().size} " +
+//                    "executed ${client.dispatcher.queuedCalls().stream().filter { it -> it.isExecuted() }.count()}"
+//        )
         val request = Request.Builder().run {
             url("http://localhost:1234/external/process?serviceName=${account.property.serviceName}&accountName=${account.property.accountName}&transactionId=$transactionId")
             post(emptyBody)
@@ -230,24 +259,29 @@ class PaymentQueue(
                 }
             }
         })
-        logger.error(
-            "Avg exec time ${
-                account.executionTimes.size.apply {
-                    if (this != 0)
-                        account.executionTimes.sum() / this
-                }
-            } seconds")
+
+    }
+
+    private fun getAvgExecTimeForAccount(account: AccountWrapper): Long {
+        // TODO просмотреть содержимое массива
+        val sum = account.executionTimes.sum()
+        val size = account.executionTimes.size
+        return if (size != 0) {
+            sum / size
+        } else {
+            0
+        }
     }
 
     private fun updateStat(account: AccountWrapper, paymentStartedAt: Long) {
-        account.executionTimes.add((System.currentTimeMillis() - paymentStartedAt) / 1000)
+        account.executionTimes.add((System.currentTimeMillis() - paymentStartedAt))
     }
 }
 
 data class AccountWrapper(
     val property: ExternalServiceProperties,
     val queue: ArrayBlockingQueue<() -> Unit>,
-    val executionTimes: ConcurrentSkipListSet<Long>,
+    val executionTimes: ConcurrentSkipListSet<Long>, // TODO заменить skipListSet
     val coroutineScope: CoroutineScope
 )
 
