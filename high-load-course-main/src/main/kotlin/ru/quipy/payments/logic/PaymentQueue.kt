@@ -77,7 +77,7 @@ class PaymentQueue(
     init {
         properties.forEach {
 
-            val queue: ArrayBlockingQueue<() -> Unit> = ArrayBlockingQueue(100)
+            val queue: ArrayBlockingQueue<ExecutableWithTimeStamp> = ArrayBlockingQueue(100)
             val wrapper = AccountWrapper(
                 it, queue, ConcurrentSkipListSet(),
                 scope
@@ -86,7 +86,7 @@ class PaymentQueue(
 
             val job = scope.launch {
                 while (true) {
-                    wrapper.queue.poll()?.invoke()
+                    wrapper.queue.poll()?.executable?.invoke()
                     delay(50)
                 }
             }.invokeOnCompletion { th -> if (th != null) logger.error("Job completed", th) }
@@ -158,24 +158,28 @@ class PaymentQueue(
         }
 
         // а не переполнена ли очередь?
-        val currentQueueSize = selectedProperty.queue.size - 1
+        val currentQueueSize = selectedProperty.queue.size
         if (currentQueueSize > requestsQueueSizeLimit) {
-            // чистим очередь?
+            while (System.currentTimeMillis() - selectedProperty.queue.poll().paymentStartedAt > 80_000) {
+                logger.error("Delete element from queue")
+            }
         }
 
-        val predictedExecutionTime = getAvgExecTimeForAccount(selectedProperty) * currentQueueSize
+        val predictedTimeMillis = client.dispatcher.queuedCallsCount() / 80 * 10_000
+        // A = 1000 / avg req / s
         logger.error(
-            "Avg exec time for ${selectedProperty.property.accountName} is $predictedExecutionTime ms "
+            "Predicted exec time for ${selectedProperty.property.accountName} is $predictedTimeMillis ms. my Queue size ${currentQueueSize}. client size ${client.dispatcher.queuedCallsCount()}"
         )
 
-//        if (predictedExecutionTime - 80_000 > delta) {
-//            logger.error("sorry bro, too long ${(predictedExecutionTime)} ms")
-//            savePayment(paymentId, transactionId, false)
-//            return
-//        }
-        selectedProperty.queue.put {
-            runAsyncRequest(selectedProperty, transactionId, paymentId, paymentStartedAt)
+        if (System.currentTimeMillis() - paymentStartedAt + predictedTimeMillis > 80_000) {
+            logger.error("sorry bro, too long ${(System.currentTimeMillis() - paymentStartedAt + predictedTimeMillis)} ms")
+            savePayment(paymentId, transactionId, false)
+            return
         }
+        selectedProperty.queue.put(
+            ExecutableWithTimeStamp(paymentStartedAt) {
+                runAsyncRequest(selectedProperty, transactionId, paymentId, paymentStartedAt)
+            })
     }
 
     private fun runRequest(
@@ -280,12 +284,12 @@ class PaymentQueue(
 
 data class AccountWrapper(
     val property: ExternalServiceProperties,
-    val queue: ArrayBlockingQueue<() -> Unit>,
+    val queue: ArrayBlockingQueue<ExecutableWithTimeStamp>,
     val executionTimes: ConcurrentSkipListSet<Long>, // TODO заменить skipListSet
     val coroutineScope: CoroutineScope
 )
 
-data class RequestStatistic(
-    val realStart: Long,
-    val realEnd: Long,
+data class ExecutableWithTimeStamp(
+    val paymentStartedAt: Long,
+    val executable: () -> Unit,
 )
