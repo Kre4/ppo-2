@@ -6,12 +6,16 @@ import com.itmo.microservices.demo.common.metrics.Metrics
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.github.resilience4j.ratelimiter.RateLimiterRegistry
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import javax.annotation.PostConstruct
@@ -25,13 +29,23 @@ class ExternalSystemController(
     companion object {
         val logger = LoggerFactory.getLogger(ExternalSystemController::class.java)
         const val rateLimitDefault = 1
-        val rateLimitDefaultUnit = TimeUnit.SECONDS
-        const val winDefault = 8
+        val gotRequests: MutableList<Long> = mutableListOf();
+        private val scope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
     }
 
     private val invoices = ConcurrentHashMap<String, AtomicInteger>()
 
     private val accounts = ConcurrentHashMap<String, Account>()
+
+    private val releaseJob = scope.launch {
+        val timeout: Long = 60 * 1000
+        while (true) {
+            val list = gotRequests.toList()
+            val currentStamp = System.currentTimeMillis()
+            logger.error("For $timeout ms ${list.stream().filter{ currentStamp - it <= timeout}.count()} were processed")
+            delay(timeout)
+        }
+    }.invokeOnCompletion { th -> if (th != null) logger.error("Monitor complete", th) }
 
     @PostConstruct
     fun init() {
@@ -168,8 +182,10 @@ class ExternalSystemController(
         @RequestParam accountName: String,
         @RequestParam transactionId: String
     ): ResponseEntity<Response> {
+        logger.error("Get request for tx $transactionId")
         val start = System.currentTimeMillis()
 
+        gotRequests.add(System.currentTimeMillis())
         val account = accounts["$serviceName-$accountName"] ?: error("No such account $serviceName-$accountName")
         val totalAmount = invoices.computeIfAbsent("$serviceName-$accountName") { AtomicInteger() }.let {
             it.addAndGet(account.price)
@@ -179,9 +195,10 @@ class ExternalSystemController(
             .withTags(Metrics.serviceLabel to serviceName, "accountName" to accountName)
             .externalSysChargeAmountRecord(account.price)
 
-        logger.info("Account $accountName charged ${account.price} from service ${account.serviceName}. Total amount: $totalAmount")
+        logger.warn("Account $accountName charged ${account.price} from service ${account.serviceName}. Total amount: $totalAmount")
 
         if (!account.rateLimiter.acquirePermission()) {
+            logger.error("Rate limit for account: $accountName breached")
             Metrics
                 .withTags(Metrics.serviceLabel to serviceName, "accountName" to accountName, "outcome" to "RL_BREACHED")
                 .externalSysDurationRecord(System.currentTimeMillis() - start)
@@ -203,6 +220,7 @@ class ExternalSystemController(
                     account.window.release()
                 }
             } else {
+                logger.error("Parallel requests limit for account: $accountName breached. Already ${account.window.maxWinSize} executing")
                 Metrics
                     .withTags(
                         Metrics.serviceLabel to serviceName,
