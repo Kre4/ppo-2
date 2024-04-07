@@ -5,13 +5,11 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.internal.synchronized
 import kotlinx.coroutines.launch
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -20,13 +18,7 @@ import java.util.*
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.Executors
-import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicLongArray
-import java.util.concurrent.atomic.AtomicReferenceArray
-import kotlin.math.abs
-import kotlin.math.log
 
 
 // callbacks
@@ -93,7 +85,6 @@ class PaymentQueue(
             val clearJob = scope.launch {
                 while (true) {
                     delay(20_000)
-                    logger.error("clear stat")
                     wrapper.executionTimes.clear()
                 }
             }
@@ -112,15 +103,6 @@ class PaymentQueue(
     }
 
     private fun processTransaction(paymentId: UUID, transactionId: UUID, amount: Int, paymentStartedAt: Long) {
-//        val selectedProperty: AccountWrapper? = getProperties()
-//        // ресурс не был захвачен,
-//        if (selectedProperty == null) {
-//            savePayment(paymentId, transactionId, false)
-//            return
-//        }
-//        // в случае успеха выполняем запрос
-//        runRequest(selectedProperty.property, transactionId, paymentId, paymentStartedAt)
-//        logger.error("2Request process saved, duration: ${now() - paymentStartedAt}")
         putRequestInQueue(paymentId, transactionId, amount, paymentStartedAt)
     }
 
@@ -136,24 +118,24 @@ class PaymentQueue(
     }
 
     private fun savePayment(paymentId: UUID, transactionId: UUID, success: Boolean, reason: String? = null) {
+        logger.error("Saving payment succ: $success, reason $reason for tx ${transactionId} and pId ${paymentId}")
         val saved = paymentESService.update(paymentId) {
             it.logProcessing(success, now(), transactionId, reason = reason)
         }
-//        logger.error("Request process saved, duration: ${saved.spentInQueueDuration}")
     }
 
     private fun putRequestInQueue(paymentId: UUID, transactionId: UUID, amount: Int, paymentStartedAt: Long) {
 
         // если уже вы
         if (now() - paymentStartedAt > 75_000) {
-            savePayment(paymentId, transactionId, false)
+            savePayment(paymentId, transactionId, false, "Process started too late")
             return
         }
         val selectedProperty: AccountWrapper? = getProperties()
 
         // не смогли получить ресурсы
         if (selectedProperty == null) {
-            savePayment(paymentId, transactionId, false)
+            savePayment(paymentId, transactionId, false, "No free resource")
             return
         }
 
@@ -161,19 +143,14 @@ class PaymentQueue(
         val currentQueueSize = selectedProperty.queue.size
         if (currentQueueSize > requestsQueueSizeLimit) {
             while (System.currentTimeMillis() - selectedProperty.queue.poll().paymentStartedAt > 80_000) {
-                logger.error("Delete element from queue")
             }
         }
 
+        // после разгона прибавлять вес среднему значению
         val predictedTimeMillis = client.dispatcher.queuedCallsCount() / 80 * 10_000
-        // A = 1000 / avg req / s
-        logger.error(
-            "Predicted exec time for ${selectedProperty.property.accountName} is $predictedTimeMillis ms. my Queue size ${currentQueueSize}. client size ${client.dispatcher.queuedCallsCount()}"
-        )
 
         if (System.currentTimeMillis() - paymentStartedAt + predictedTimeMillis > 80_000) {
-            logger.error("sorry bro, too long ${(System.currentTimeMillis() - paymentStartedAt + predictedTimeMillis)} ms")
-            savePayment(paymentId, transactionId, false)
+            savePayment(paymentId, transactionId, false, "predicted more than 80s")
             return
         }
         selectedProperty.queue.put(
@@ -182,51 +159,12 @@ class PaymentQueue(
             })
     }
 
-    private fun runRequest(
-        property: ExternalServiceProperties,
-        transactionId: UUID, // 16 bytes
-        paymentId: UUID, // 16 bytes
-        paymentStartedAt: Long // 8 bytes
-    ) {
-        logger.error("run request")
-        try {
-            val request = Request.Builder().run {
-                url("http://localhost:1234/external/process?serviceName=${property.serviceName}&accountName=${property.accountName}&transactionId=$transactionId")
-                post(emptyBody)
-            }.build()
-            logger.warn("[${property.accountName}] Start request for ${paymentId}")
-            client.newCall(request).execute().use { response ->
-
-                val body = try {
-                    mapper.readValue(
-                        response.body?.string(),
-                        ExternalSysResponse::class.java
-                    )
-                } catch (e: Exception) {
-                    ExternalSysResponse(false, e.message)
-                }
-
-                logger.error("Time spend on request ${now() - paymentStartedAt} ms for txId: $transactionId status: ${body.message}")
-                savePayment(paymentId, transactionId, body.result, body.message)
-            }
-        } catch (e: Exception) {
-            logger.error("Error while processing ${e.message}")
-            savePayment(paymentId, transactionId, false, e.message)
-        } finally {
-            property.blockingWindow.release()
-        }
-    }
-
     private fun runAsyncRequest(
         account: AccountWrapper, // 8 bytes
         transactionId: UUID, // 16 bytes
         paymentId: UUID, // 16 bytes
         paymentStartedAt: Long // 8 bytes, -> total 48 bytes
     ) {
-//        logger.error(
-//            "Start new enqueue, dispatcher queued size: ${client.dispatcher.queuedCalls().size} " +
-//                    "executed ${client.dispatcher.queuedCalls().stream().filter { it -> it.isExecuted() }.count()}"
-//        )
         val request = Request.Builder().run {
             url("http://localhost:1234/external/process?serviceName=${account.property.serviceName}&accountName=${account.property.accountName}&transactionId=$transactionId")
             post(emptyBody)
@@ -236,29 +174,27 @@ class PaymentQueue(
             override fun onFailure(call: Call, e: IOException) {
                 updateStat(account, requestStart)
                 call.cancel()
-                logger.error("result: Fail")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message)
-
-                }
+                savePayment(paymentId, transactionId, false, e.message)
+//                paymentESService.update(paymentId) {
+//                    it.logProcessing(false, now(), transactionId, reason = e.message)
+//
+//                }
             }
 
             override fun onResponse(call: Call, response: Response) {
-                logger.error("result: Succ")
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
-                    logger.error("[${account.property.accountName}] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                     ExternalSysResponse(false, e.message)
                 }
                 updateStat(account, requestStart)
                 try {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                    savePayment(paymentId, transactionId, body.result, body.message)
+//                    paymentESService.update(paymentId) {
+//                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+//                    }
                     account.property.blockingWindow.release()
                 } catch (e: Exception) {
-                    logger.error("Critical error, transaction lost")
                     account.property.blockingWindow.release()
                 }
             }
