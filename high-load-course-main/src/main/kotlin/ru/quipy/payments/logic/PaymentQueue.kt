@@ -19,6 +19,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 
 // callbacks
@@ -33,6 +34,7 @@ class PaymentQueue(
         val mapper = ObjectMapper().registerKotlinModule()
         val delta = 10_000
         val requestsQueueSizeLimit: Int = 3000
+        val dispatcherThreadPoolSize = 3
         // Посчитать объем V/W, где V объем очереди который можем позволить. Пусть на каждую 307Mb ~ 307_000_000B
         // Элемент 100B -> можем иметь очередь на 3млн элементов, правда она нам не нужна
 
@@ -41,15 +43,13 @@ class PaymentQueue(
 
     private val paymentExecutor = Executors.newFixedThreadPool(500, NamedThreadFactory("queue-executor"))
 
-    private val queueWatcher = Executors.newFixedThreadPool(500, NamedThreadFactory("watcher"))
-
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
     private val resources: MutableList<AccountWrapper> = mutableListOf()
 
     // общий клиент
-    private val httpClientExecutor = Executors.newFixedThreadPool(80)
+    private val httpClientExecutor = Executors.newFixedThreadPool(dispatcherThreadPoolSize)
 
     private val client = OkHttpClient.Builder().run {
         dispatcher(Dispatcher(httpClientExecutor)
@@ -58,37 +58,78 @@ class PaymentQueue(
                 maxRequestsPerHost = 400
             })
         connectionPool(ConnectionPool(100, 5, TimeUnit.MINUTES))
-        callTimeout(80, TimeUnit.SECONDS)
+        callTimeout(15_000, TimeUnit.SECONDS)
         protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
         build()
     }
 
-
+    private val requestsBuffer: ArrayBlockingQueue<FutureBufferedRequest> = ArrayBlockingQueue(1000);
     private val scope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
     init {
         properties.forEach {
-
             val queue: ArrayBlockingQueue<ExecutableWithTimeStamp> = ArrayBlockingQueue(100)
             val wrapper = AccountWrapper(
                 it, queue, ConcurrentSkipListSet(),
-                scope
+                scope, AtomicBoolean(false),
+                OkHttpClient.Builder().run {
+                    dispatcher(Dispatcher(Executors.newFixedThreadPool(dispatcherThreadPoolSize))
+                        .apply {
+                            maxRequests = dispatcherThreadPoolSize * 10
+                            maxRequestsPerHost = dispatcherThreadPoolSize * 10
+                        })
+                    connectionPool(ConnectionPool(100, 5, TimeUnit.MINUTES))
+                    callTimeout(it.upperLimit, TimeUnit.SECONDS) // timeout по времени гарант ответа
+                    protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+                    build()
+                }
+//                client
             )
             resources.add(wrapper)
 
             val job = scope.launch {
                 while (true) {
-                    wrapper.queue.poll()?.executable?.invoke()
-                    delay(50)
+                    if (wrapper.queueIsBlocked.get()) {
+                        delay(10_000)
+//                        wrapper.queue.poll()?.executable?.invoke()
+                        val request = wrapper.queue.poll()
+                        if (request != null) {
+                            if (System.currentTimeMillis() - request.paymentStartedAt < 75_000) {
+                                request.executable.invoke()
+                            } else {
+                                savePayment(request.paymentId, request.transactionId, false,
+                                    "Stayed in ${wrapper.property.accountName} queue for too long")
+                            }
+                        }
+                    } else {
+                        val request = wrapper.queue.poll()
+                        if (request != null) {
+                            if (System.currentTimeMillis() - request.paymentStartedAt < 75_000) {
+                                request.executable.invoke()
+                            } else {
+                                savePayment(request.paymentId, request.transactionId, false,
+                                    "Stayed in ${wrapper.property.accountName} queue for too long")
+                            }
+                        }
+                        delay(50)
+                    }
                 }
             }.invokeOnCompletion { th -> if (th != null) logger.error("Job completed", th) }
             val clearJob = scope.launch {
                 while (true) {
-                    delay(20_000)
+                    delay(120_000)
                     wrapper.executionTimes.clear()
                 }
             }
+//            val clearBufferJob = scope.launch {
+//                while (true) {
+//
+//                }
+//            }
         }
+    }
+
+    fun executeFutureBufferedRequest(request: FutureBufferedRequest) {
 
     }
 
@@ -108,17 +149,20 @@ class PaymentQueue(
 
     private fun getProperties(): AccountWrapper? {
         for (property in resources) {
-            // пробуем захват ресурса для аккаунта
-            if (property.property.blockingWindow.tryAcquire() && property.property.rateLimiter.tick()) {
-                // в случае успеха, иначе идем дальше по всем аккаунтам
-                return property
+            if (!property.queueIsBlocked.get()) {
+                // пробуем захват ресурса для аккаунта
+                if (property.property.blockingWindow.tryAcquire() && property.property.rateLimiter.tick()) {
+                    // в случае успеха, иначе идем дальше по всем аккаунтам
+                    return property
+                }
             }
         }
-        return null
+        return resources[0]
     }
 
     private fun savePayment(paymentId: UUID, transactionId: UUID, success: Boolean, reason: String? = null) {
-        logger.error("Saving payment succ: $success, reason $reason for tx ${transactionId} and pId ${paymentId}")
+        if (!success)
+            logger.error("Saving payment succ: $success, reason $reason for tx ${transactionId} and pId ${paymentId}")
         val saved = paymentESService.update(paymentId) {
             it.logProcessing(success, now(), transactionId, reason = reason)
         }
@@ -134,27 +178,32 @@ class PaymentQueue(
         val selectedProperty: AccountWrapper? = getProperties()
 
         // не смогли получить ресурсы
+
+        // TODO не бросаем запрос, помещаем его в буфер и пробуем запускать отдельно
         if (selectedProperty == null) {
-            savePayment(paymentId, transactionId, false, "No free resource")
+            requestsBuffer.put(FutureBufferedRequest(transactionId, paymentId, paymentStartedAt))
+//            savePayment(paymentId, transactionId, false, "No free resource")
             return
         }
 
         // а не переполнена ли очередь?
         val currentQueueSize = selectedProperty.queue.size
-        if (currentQueueSize > requestsQueueSizeLimit) {
-            while (System.currentTimeMillis() - selectedProperty.queue.poll().paymentStartedAt > 80_000) {
-            }
-        }
+//        if (currentQueueSize > requestsQueueSizeLimit) {
+//            while (System.currentTimeMillis() - selectedProperty.queue.poll().paymentStartedAt > 80_000) {
+//            }
+//        }
 
         // после разгона прибавлять вес среднему значению
-        val predictedTimeMillis = client.dispatcher.queuedCallsCount() / 80 * 10_000
+        val predictedTimeMillis =
+            selectedProperty.httpClient.dispatcher.queuedCallsCount() / dispatcherThreadPoolSize * 10_000
+//                    getAvgExecTimeForAccount(selectedProperty)
 
         if (System.currentTimeMillis() - paymentStartedAt + predictedTimeMillis > 80_000) {
             savePayment(paymentId, transactionId, false, "predicted more than 80s")
             return
         }
         selectedProperty.queue.put(
-            ExecutableWithTimeStamp(paymentStartedAt) {
+            ExecutableWithTimeStamp(paymentId, transactionId, paymentStartedAt) {
                 runAsyncRequest(selectedProperty, transactionId, paymentId, paymentStartedAt)
             })
     }
@@ -170,15 +219,14 @@ class PaymentQueue(
             post(emptyBody)
         }.build()
         val requestStart = System.currentTimeMillis()
-        client.newCall(request).enqueue(object : Callback {
+        // todo KRE4 dynamic timeout
+        account.httpClient.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 updateStat(account, requestStart)
+                account.queueIsBlocked.set(true)
+                logger.error("Block queue ${account.property.accountName} due to timeout exception")
                 call.cancel()
                 savePayment(paymentId, transactionId, false, e.message)
-//                paymentESService.update(paymentId) {
-//                    it.logProcessing(false, now(), transactionId, reason = e.message)
-//
-//                }
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -190,20 +238,22 @@ class PaymentQueue(
                 updateStat(account, requestStart)
                 try {
                     savePayment(paymentId, transactionId, body.result, body.message)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-//                    }
                     account.property.blockingWindow.release()
+                    val wasBlockedBefore = account.queueIsBlocked.get()
+                    account.queueIsBlocked.set(false)
+                    logger.error("Unblock queue ${account.property.accountName} due to success request, was blocked before: $wasBlockedBefore was executed ${System.currentTimeMillis() - paymentStartedAt}")
+//                    if (System.currentTimeMillis() - paymentStartedAt > 80_000){
+//                        logger.error("Clear dispatcher after ")
+//                        account.httpClient.dispatcher.cancelAll()
+//                    }
                 } catch (e: Exception) {
                     account.property.blockingWindow.release()
                 }
             }
         })
-
     }
 
     private fun getAvgExecTimeForAccount(account: AccountWrapper): Long {
-        // TODO просмотреть содержимое массива
         val sum = account.executionTimes.sum()
         val size = account.executionTimes.size
         return if (size != 0) {
@@ -221,11 +271,21 @@ class PaymentQueue(
 data class AccountWrapper(
     val property: ExternalServiceProperties,
     val queue: ArrayBlockingQueue<ExecutableWithTimeStamp>,
-    val executionTimes: ConcurrentSkipListSet<Long>, // TODO заменить skipListSet
-    val coroutineScope: CoroutineScope
+    val executionTimes: ConcurrentSkipListSet<Long>,
+    val coroutineScope: CoroutineScope,
+    val queueIsBlocked: AtomicBoolean,
+    val httpClient: OkHttpClient,
 )
 
 data class ExecutableWithTimeStamp(
+    val paymentId: UUID,
+    val transactionId: UUID,
     val paymentStartedAt: Long,
     val executable: () -> Unit,
+)
+
+data class FutureBufferedRequest(
+    val transactionId: UUID, // 16 bytes
+    val paymentId: UUID, // 16 bytes
+    val paymentStartedAt: Long // 8 bytes, -> total 40 bytes
 )

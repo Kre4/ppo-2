@@ -24,7 +24,7 @@ data class ExternalServiceProperties(
     val rateLimiter: RateLimiter,
     val blockingWindow: OngoingWindow,
     val unblockingWindow: NonBlockingOngoingWindow,
-    val upperLimit: Int,
+    val upperLimit: Long,
 
 //    val request95thPercentileProcessingTime: Duration = Duration.ofSeconds(11)
 //    val window: NonBlockingOngoingWindow,
