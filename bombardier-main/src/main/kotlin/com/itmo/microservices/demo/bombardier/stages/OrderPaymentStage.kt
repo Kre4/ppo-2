@@ -12,6 +12,7 @@ import com.itmo.microservices.demo.bombardier.logging.OrderPaymentNotableEvents.
 import com.itmo.microservices.demo.bombardier.utils.ConditionAwaiter
 import com.itmo.microservices.demo.common.logging.EventLoggerWrapper
 import com.itmo.microservices.demo.common.metrics.Metrics
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Component
 import java.time.Duration
 import java.util.concurrent.TimeUnit
@@ -19,6 +20,7 @@ import java.util.concurrent.TimeUnit
 @Component
 class OrderPaymentStage : TestStage {
     companion object {
+        val logger = LoggerFactory.getLogger(OrderPaymentStage::class.java)
         const val paymentOutcome = "outcome"
         const val paymentFailureReason = "failReason"
     }
@@ -74,6 +76,7 @@ class OrderPaymentStage : TestStage {
             in (0..100) -> 80L
             in (101..1000) -> 180L
             else -> testCtx().numOfParallelTests / 7L
+//            else -> 5*60L
         }
 
         ConditionAwaiter.awaitAtMost(awaitingTime, TimeUnit.SECONDS, Duration.ofSeconds(4))
@@ -82,6 +85,7 @@ class OrderPaymentStage : TestStage {
                     .any { it.transactionId == paymentSubmissionDto.transactionId }
             }
             .onFailure {
+//                logger.error("No outcome for ${it?.message} after $awaitingTime or ${System.currentTimeMillis() - startWaitingPayment}")
                 eventLogger.error(E_PAYMENT_NO_OUTCOME_FOUND, order.id)
                 if (it != null) {
                     throw it
@@ -96,6 +100,7 @@ class OrderPaymentStage : TestStage {
         val paymentLogRecord = externalServiceApi.getOrder(testCtx().userId!!, testCtx().orderId!!).paymentHistory
             .find { it.transactionId == paymentSubmissionDto.transactionId }!!
 
+//        logger.error("paymentLogRecord ${paymentLogRecord.status}")
         val paymentTimeout = 80L
         when (val status = paymentLogRecord.status) {
             PaymentStatus.SUCCESS -> {

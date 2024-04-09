@@ -108,6 +108,7 @@ class ExternalSystemController(
                 window = SemaphoreOngoingWindow(10),
                 price = (basePrice * 0.3).toInt()
             )
+            accounts.values.forEach {blockList.put(it.accountName, false)}
         }
     }
 

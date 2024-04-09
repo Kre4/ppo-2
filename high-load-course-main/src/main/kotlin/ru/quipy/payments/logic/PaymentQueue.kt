@@ -121,16 +121,33 @@ class PaymentQueue(
                     wrapper.executionTimes.clear()
                 }
             }
-//            val clearBufferJob = scope.launch {
-//                while (true) {
-//
-//                }
-//            }
         }
-    }
 
-    fun executeFutureBufferedRequest(request: FutureBufferedRequest) {
+        val clearBufferJob = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher()).launch {
+            while (true) {
+                val futureRequest = requestsBuffer.poll();
+                logger.error("Poll element out of buffer. Is null: ${futureRequest == null}")
+                if (futureRequest == null) {
+                    delay(5_000)
+                    continue;
+                }
+                if (System.currentTimeMillis() - futureRequest.paymentStartedAt > 75_000) {
+                    savePayment(futureRequest.paymentId, futureRequest.transactionId, false,
+                        "Stayed in buffered queue for too long")
+                    delay(50)
+                    continue
+                }
+                val selectedProperty = getProperties()
+                if (selectedProperty == null) {
+                    requestsBuffer.put(futureRequest)
+                } else {
+                    calculateTimeAndPutInQueue(selectedProperty, futureRequest.paymentId,
+                        futureRequest.transactionId, futureRequest.paymentStartedAt)
+                }
 
+
+            }
+        }
     }
 
     fun startTransaction(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
@@ -157,7 +174,7 @@ class PaymentQueue(
                 }
             }
         }
-        return resources[0]
+        return null
     }
 
     private fun savePayment(paymentId: UUID, transactionId: UUID, success: Boolean, reason: String? = null) {
@@ -179,7 +196,7 @@ class PaymentQueue(
 
         // не смогли получить ресурсы
 
-        // TODO не бросаем запрос, помещаем его в буфер и пробуем запускать отдельно
+        // не бросаем запрос, помещаем его в буфер и пробуем запускать отдельно
         if (selectedProperty == null) {
             requestsBuffer.put(FutureBufferedRequest(transactionId, paymentId, paymentStartedAt))
 //            savePayment(paymentId, transactionId, false, "No free resource")
@@ -194,6 +211,22 @@ class PaymentQueue(
 //        }
 
         // после разгона прибавлять вес среднему значению
+        calculateTimeAndPutInQueue(selectedProperty, paymentId, transactionId, paymentStartedAt)
+//        val predictedTimeMillis =
+//            selectedProperty.httpClient.dispatcher.queuedCallsCount() / dispatcherThreadPoolSize * 10_000
+//
+//        if (System.currentTimeMillis() - paymentStartedAt + predictedTimeMillis > 80_000) {
+//            savePayment(paymentId, transactionId, false, "predicted more than 80s")
+//            return
+//        }
+//        selectedProperty.queue.put(
+//            ExecutableWithTimeStamp(paymentId, transactionId, paymentStartedAt) {
+//                runAsyncRequest(selectedProperty, transactionId, paymentId, paymentStartedAt)
+//            })
+    }
+
+    private fun calculateTimeAndPutInQueue(selectedProperty: AccountWrapper, paymentId: UUID,
+                                           transactionId: UUID, paymentStartedAt: Long) {
         val predictedTimeMillis =
             selectedProperty.httpClient.dispatcher.queuedCallsCount() / dispatcherThreadPoolSize * 10_000
 //                    getAvgExecTimeForAccount(selectedProperty)
@@ -242,10 +275,10 @@ class PaymentQueue(
                     val wasBlockedBefore = account.queueIsBlocked.get()
                     account.queueIsBlocked.set(false)
                     logger.error("Unblock queue ${account.property.accountName} due to success request, was blocked before: $wasBlockedBefore was executed ${System.currentTimeMillis() - paymentStartedAt}")
-//                    if (System.currentTimeMillis() - paymentStartedAt > 80_000){
-//                        logger.error("Clear dispatcher after ")
-//                        account.httpClient.dispatcher.cancelAll()
-//                    }
+                    if (System.currentTimeMillis() - paymentStartedAt > 80_000){
+                        logger.error("Clear dispatcher of ${account.property.accountName}, size: ${account.httpClient.dispatcher.queuedCallsCount()} because requests take too long")
+                        account.httpClient.dispatcher.cancelAll()
+                    }
                 } catch (e: Exception) {
                     account.property.blockingWindow.release()
                 }
